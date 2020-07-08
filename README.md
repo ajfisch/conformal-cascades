@@ -12,6 +12,8 @@ Efficient implementations of online predictors for the tasks considered here mig
 
 ### Tasks
 
+(Training code coming soon.)
+
 Code for training models for extractive question answering ([qa](qa)), information retrieval for fact verification ([ir](ir)), and in-silico screening for drug discovery ([hiv](hiv)), can be found in their respective sub-directories (which also contain further instuctions).
 
 The outputs we used in our experiments are available in the `data/predictions` directory after downloading and untarring the data:
