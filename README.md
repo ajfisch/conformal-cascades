@@ -41,7 +41,7 @@ wget https://cpcascade.s3.us-east-2.amazonaws.com/ir.tar.gz && tar -xvf ir.tar.g
 popd
 ```
 
-The results in our paper (i.e., Table 1) can then be reproduced via the following commands:
+The results in our paper (i.e., Table 1) can then be reproduced via the following commands (*results may differ slightly due to randomness*):
 
 ```
 ./run_chembl.sh test
