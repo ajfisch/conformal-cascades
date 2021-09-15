@@ -17,7 +17,7 @@ split=$1
 python chembl/conformal_chembl.py \
        --metrics=MPN \
        --eval_dir data/chembl/$split \
-       --num_trials 10 \
+       --num_trials 20 \
        --outer_threads 0 \
        --inner_threads 40 \
        --cuda=true \
@@ -33,7 +33,7 @@ python chembl/conformal_chembl.py \
 python chembl/conformal_chembl.py \
        --metrics=MPN \
        --eval_dir data/chembl/$split \
-       --num_trials 10 \
+       --num_trials 20 \
        --outer_threads 0 \
        --inner_threads 40 \
        --cuda=true \
@@ -50,7 +50,7 @@ python chembl/conformal_chembl.py \
        --metrics=RF,MPN \
        --correction=bonferroni \
        --eval_dir data/chembl/$split \
-       --num_trials 10 \
+       --num_trials 20 \
        --outer_threads 0 \
        --inner_threads 40 \
        --cuda=true \

@@ -18,7 +18,7 @@ python ir/conformal_ir.py \
        --eval_file data/ir/preds_$split.jsonl \
        --gold_file data/ir/$split.jsonl \
        --metrics=logit \
-       --num_trials=50 \
+       --num_trials=20 \
        --outer_threads=50 \
        --inner_threads=0 \
        --cuda=false \
@@ -35,7 +35,7 @@ python ir/conformal_ir.py \
        --eval_file data/ir/preds_$split.jsonl \
        --gold_file data/ir/$split.jsonl \
        --metrics=logit \
-       --num_trials=50 \
+       --num_trials=20 \
        --outer_threads=50 \
        --inner_threads=0 \
        --cuda=false \
@@ -54,7 +54,7 @@ python ir/conformal_ir.py \
        --gold_file data/ir/$split.jsonl \
        --correction=simes \
        --metrics=bm25,logit \
-       --num_trials=50 \
+       --num_trials=20 \
        --outer_threads=50 \
        --inner_threads=0 \
        --cuda=false \
