@@ -1,8 +1,8 @@
 """Evaluation for FEVER IR."""
 
-import collections
 import json
 import os
+import sys
 import jsonlines
 from tqdm import tqdm
 
@@ -13,16 +13,16 @@ from absl import logging
 import numpy as np
 from cpcascade import run_experiment
 
-DEFAULT_DEV_FILE = None
-DEFAULT_TEST_FILE = None
+DEFAULT_GOLD_FILE = "data/ir/test.jsonl"
+DEFAULT_PRED_FILE = "data/ir/preds_test.jsonl"
 
-flags.DEFINE_string("dev_predictions_file", None,
-                    "Path to retriever's predictions for development set.")
+flags.DEFINE_string("eval_file", DEFAULT_PRED_FILE,
+                    "Path to retriever's predictions.")
 
-flags.DEFINE_string("test_predictions_file", None,
-                    "Path to retriever's predictions for development set.")
+flags.DEFINE_string("gold_file", DEFAULT_GOLD_FILE,
+                    "File with gold answers.")
 
-flags.DEFINE_integer("num_trials", 10, "Number of trials to run.")
+flags.DEFINE_integer("num_trials", 40, "Number of trials to run.")
 
 flags.DEFINE_string("trials_file", None,
                     "The output file where the trials qids will be written.")
@@ -30,22 +30,19 @@ flags.DEFINE_string("trials_file", None,
 flags.DEFINE_boolean("overwrite_trials", False,
                      "Recompute and overwrite the trials qids if they exist.")
 
-flags.DEFINE_string("dev_gold_file", DEFAULT_DEV_FILE,
-                    "Dev set file with gold answers.")
-
-flags.DEFINE_string("test_gold_file", DEFAULT_TEST_FILE,
-                    "Test set file with gold answers.")
-
 flags.DEFINE_list("epsilons", None,
                   "Target accuracyies of 1 - epsilon to evaluate.")
 
 flags.DEFINE_list("metrics", "rank",
                   "The conformal scores to use (comma separated).")
 
+flags.DEFINE_boolean("debug", False,
+                     "Output debug logs.")
+
 FLAGS = flags.FLAGS
 
 
-def load_predictions(file_path, metrics):
+def load_predictions(file_path, qid2answers, metrics):
     """
     Load predictions file and gather predictions for the same query.
     all_examples[qid] = list(dict(properties of candidate sentence))
@@ -60,6 +57,19 @@ def load_predictions(file_path, metrics):
         case["text"] = case["evidence"]
         all_examples[qid].append(case)
 
+    # We choose one label that's annotated as being correct as the reference.
+    references = {}
+    filtered = {}
+    for qid, predictions in all_examples.items():
+        correct_idx = [i for i, y in enumerate(predictions) if y["text"] in qid2answers[qid]]
+        if len(correct_idx) == 0:
+            continue
+        filtered[qid] = predictions
+        references[qid] = np.random.choice(correct_idx).item()
+
+    logging.info("Filtered %d with no answer" % (len(all_examples) - len(filtered)))
+    all_examples = filtered
+
     max_labels = 0
     for qid, predictions in all_examples.items():
         sorted_predictions_sent = sorted(predictions, key=lambda y: -y["sent_bm25"])
@@ -70,39 +80,20 @@ def load_predictions(file_path, metrics):
         max_labels = max(len(predictions), max_labels)
 
     logging.info("Maximum labels = %d", max_labels)
-    return all_examples
+    return all_examples, references
 
 
-def get_fever_title_to_annotation_ids(file_path):
-    """Return mapping of doc title --> annotation_ids of queries that refer to it."""
-    title2qids = collections.defaultdict(list)
-    for case in jsonlines.Reader(open(file_path, "r")):
-        # This dataset has only one gold doc per query.
-        title = case["docids"][0]
-        qid = case["annotation_id"]
-        if qid not in title2qids[title]:
-            title2qids[title].append(qid)
-
-    return title2qids
-
-
-def create_trials(title_splits, num_trials, percent=0.8):
+def create_trials(qids, num_trials, percent=0.8):
     """Create splits for trials, stratified by article."""
-    title_splits = list(title_splits.values())
     calibration_qids = []
     test_qids = []
 
     # Repeat the experiment N times.
     for _ in tqdm(range(num_trials)):
-        np.random.shuffle(title_splits)
-        split = int(percent * len(title_splits))
-        calibration_qids.append([])
-        for qids in title_splits[:split]:
-            calibration_qids[-1].extend(qids)
-
-        test_qids.append([])
-        for qids in title_splits[split:]:
-            test_qids[-1].extend(qids)
+        np.random.shuffle(qids)
+        split = int(percent * len(qids))
+        calibration_qids.append(qids[:split])
+        test_qids.append(qids[split:])
 
     return calibration_qids, test_qids
 
@@ -141,42 +132,12 @@ def get_metric(label, metric):
 
 
 def main(_):
-    logging.set_verbosity(logging.INFO)
+    if FLAGS.debug:
+        logging.set_verbosity(logging.DEBUG)
+    else:
+        logging.set_verbosity(logging.INFO)
     np.random.seed(FLAGS.seed)
 
-    FLAGS.epsilons = [float(f) for f in FLAGS.epsilons or []]
-
-    logging.info("Loading data.")
-    all_examples = load_predictions(FLAGS.dev_predictions_file, FLAGS.metrics)
-    qid2answers = get_fever_gold_answers(FLAGS.dev_gold_file)
-
-    if FLAGS.test_predictions_file:
-        logging.info("Combining dev with data from test file.")
-        test_examples = load_predictions(FLAGS.test_predictions_file, FLAGS.metrics)
-        all_examples.update(test_examples)
-
-        qid2answers_test = get_fever_gold_answers(FLAGS.test_gold_file)
-        qid2answers.update(qid2answers_test)
-
-    if not FLAGS.trials_file:
-        FLAGS.trials_file = os.path.splitext(FLAGS.dev_gold_file)[0]
-        FLAGS.trials_file += "-trials=%d-wtest=%d.json" % (FLAGS.num_trials,
-                                                           FLAGS.test_predictions_file is not None)
-    os.makedirs(os.path.dirname(FLAGS.trials_file), exist_ok=True)
-    if os.path.exists(FLAGS.trials_file) and not FLAGS.overwrite_trials:
-        logging.info("Loading trials from %s", FLAGS.trials_file)
-        with open(FLAGS.trials_file, "r") as f:
-            trial_qids = json.load(f)
-    else:
-        title2qids = get_fever_title_to_annotation_ids(FLAGS.dev_gold_file)
-        if FLAGS.test_predictions_file:
-            title2qids.update(get_fever_title_to_annotation_ids(FLAGS.test_gold_file))
-        trial_qids = create_trials(title2qids, FLAGS.num_trials)
-        logging.info("Writing trials to %s", FLAGS.trials_file)
-        with open(FLAGS.trials_file, "w") as f:
-            json.dump(trial_qids, f)
-
-    calibration_qids, test_qids = trial_qids
     if FLAGS.skip_conformal:
         suffix = "/ir/baselines-trials=%s/" % FLAGS.num_trials
     else:
@@ -184,17 +145,75 @@ def main(_):
                   "-equivalence=%s/" %
                   (FLAGS.num_trials, FLAGS.smoothed, FLAGS.correction,
                    ",".join(FLAGS.metrics), FLAGS.equivalence))
+
     FLAGS.output_dir += suffix
+    if (not FLAGS.overwrite_output
+        and os.path.exists(FLAGS.output_dir)
+        and os.path.exists(FLAGS.output_dir + 'results.json')):
+        logging.info("Output path exists: '%s'", FLAGS.output_dir)
+        sys.exit(0)
+
     os.makedirs(FLAGS.output_dir, exist_ok=True)
+
+    FLAGS.epsilons = [float(f) for f in FLAGS.epsilons or []]
+
+    logging.info("Loading data.")
+    qid2answers = get_fever_gold_answers(FLAGS.gold_file)
+    all_examples, references = load_predictions(FLAGS.eval_file, qid2answers, FLAGS.metrics)
+
+    if not FLAGS.trials_file:
+        FLAGS.trials_file = os.path.splitext(FLAGS.gold_file)[0]
+        FLAGS.trials_file += "-trials=%d.json" % FLAGS.num_trials
+
+    os.makedirs(os.path.dirname(FLAGS.trials_file), exist_ok=True)
+    if os.path.exists(FLAGS.trials_file) and not FLAGS.overwrite_trials:
+        logging.info("Loading trials from %s", FLAGS.trials_file)
+        with open(FLAGS.trials_file, "r") as f:
+            trial_qids = json.load(f)
+    else:
+        trial_qids = create_trials(list(all_examples.keys()), FLAGS.num_trials)
+        logging.info("Writing trials to %s", FLAGS.trials_file)
+        with open(FLAGS.trials_file, "w") as f:
+            json.dump(trial_qids, f)
+
+    calibration_qids, test_qids = trial_qids
+
+    # Make inputs.
+    num_examples = len(all_examples)
+    max_labels = max([len(v) for v in all_examples.values()])
+    num_metrics = len(FLAGS.metrics)
+    example_matrix = np.ones((num_examples, max_labels, num_metrics)) * 1e12
+    answer_matrix = np.zeros((num_examples, max_labels))
+    label_mask = np.zeros((num_examples, max_labels))
+
+    qid2index = {}
+    index2qid = []
+    for i, qid in enumerate(all_examples.keys()):
+        index2qid.append(qid)
+        qid2index[qid] = i
+
+    calibration_ids = [[qid2index[qid] for qid in trial] for trial in calibration_qids]
+    test_ids = [[qid2index[qid] for qid in trial] for trial in test_qids]
+
+    references = np.array([references[qid] for qid in index2qid]).astype(np.long)
+    for i, qid in enumerate(index2qid):
+        labels = all_examples[qid]
+        for j, y in enumerate(labels):
+            for k, m in enumerate(FLAGS.metrics):
+                example_matrix[i, j, k] = get_metric(y, m)
+            if y["text"] in qid2answers[qid]:
+                answer_matrix[i, j] = 1
+            label_mask[i, j] = 1
+
     run_experiment(
-        all_examples=all_examples,
-        qid2answers=qid2answers,
-        calibration_qids=calibration_qids,
-        test_qids=test_qids,
-        baseline_metrics=["sent_prob", "sent_bm25"],
-        epsilons=FLAGS.epsilons,
-        efficiencies=FLAGS.efficiencies,
-        get_metric=get_metric)
+        examples=example_matrix,
+        answers=answer_matrix,
+        references=references,
+        mask=label_mask,
+        calibration_ids=calibration_ids,
+        test_ids=test_ids,
+        baseline_metrics=["bm25", "logit"],
+        epsilons=FLAGS.epsilons)
 
 
 if __name__ == "__main__":

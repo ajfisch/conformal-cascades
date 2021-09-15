@@ -70,17 +70,18 @@ flags.DEFINE_boolean("breakdown", False,
                      results to be available in their respective dirs.")
 
 flags.DEFINE_boolean("compare_corrections", False,
-                     "Compare corrections (run on ecdf dir)")
+                     "Compare corrections (run on simes dir)")
 
 flags.DEFINE_boolean("skip_single", False,
                      "Skip non comparsion/ breakdown plots")
 
-flags.DEFINE_enum("equivalence_baseline", "sample", ["all", "sample"],
-                  "Equivalence baseline to use.")
+flags.DEFINE_list("epsilons", None,
+                  "Target accuracyies of 1 - epsilon to to include in output table.")
 
 FLAGS = flags.FLAGS
 
-CORRECTIONS = ["none", "bonferroni", "simes", "ecdf"]
+#CORRECTIONS = ["none", "bonferroni", "simes", "ecdf"]
+CORRECTIONS = ["none", "bonferroni", "simes"]
 
 
 def get_task(path):
@@ -91,6 +92,10 @@ def get_task(path):
         task = "hiv"
     elif "/qa/" in path:
         task = "qa"
+    elif "/open_qa/" in path:
+        task = "open_qa"
+    elif "/chembl/" in path:
+        task = "chembl"
     else:
         raise Exception
     return task
@@ -102,7 +107,11 @@ METRIC_ABBRV = {"ir": {"rank": "BM25 rank", "logit": "CLS logit", "bm25": "BM25"
                         "svm": "SVM", "rank_svm": "rank(SVM)"},
                 "qa": {"rank": "rank(EXT)", "start_logit": "start logit", "end_logit": "end logit",
                        "sum": "sum logits", "start_prob": "start prob", "end_prob": "end prob",
-                       "rerank_logit": "CLS logit", "rerank_sigmoid": "prob(CLS)"}}
+                       "rerank_logit": "CLS logit", "rerank_sigmoid": "prob(CLS)"},
+                "open_qa": {"start_logit": "span st", "end_logit": "span en",
+                       "sum": "span sum", "relevance_logit": "parag",
+                       "psg_score": "retriever", "psg_rank": "doc rank (ret)"},
+                "chembl": {"RF": "RF", "MPN": "MPNN"}}
 
 def get_conformal(data):
     try:
@@ -112,15 +121,20 @@ def get_conformal(data):
 
 
 def get_baselines(baseline_dir):
-    task_baselines = {"ir": [("threshold_sent_bm25", "Threshold BM25"), ("top_k_sent_bm25", "Top-K BM25"),
-                             ("threshold_sent_prob", "Threshold CLS"), ("top_k_sent_prob", "Top-K CLS")],
+    task_baselines = {"ir": [
+                            #("threshold_bm25", "Threshold BM25"), ("top_k_bm25", "Top-K BM25"),
+                             ("threshold_logit", "Threshold CLS"), ("top_k_logit", "Top-K CLS")],
                       "hiv": [("threshold_chemprop_optimized", "Threshold Chemprop"),
                               ("top_k_chemprop_optimized", "Top-K Chemprop"),
                               ("threshold_random_forest", "Threshold RF"),
                               ("top_k_random_forest", "Top-K RF")],
                       "qa": [("threshold_sum", "Threshold EXT"), ("top_k_sum", "Top-K EXT"),
                              ("threshold_rerank_logit", "Threshold CLS"),
-                             ("top_k_rerank_logit", "Top-K CLS")]}
+                             ("top_k_rerank_logit", "Top-K CLS")],
+                      "chembl": [("threshold_MPN", "Threshold MPNN"), ("top_k_MPN", "Top-K MPNN")],
+                      "open_qa": [("threshold_sum", "Threshold span score"), ("top_k_sum", "Top-K span score")]}
+                      #"open_qa": [("threshold_relevance_plus_score", "Threshold sum scores"), ("top_k_relevance_plus_score", "Top-K sum scores")]}
+
     task = get_task(baseline_dir)
     metrics = task_baselines[task]
     outlist = []
@@ -213,6 +227,25 @@ def plot_results(res_dir, n_bins=100):
     data = json.load(open(res_file, "r"))
 
     eps, eff, acc, cost = get_conformal(data)
+
+    # Write output table.
+    if FLAGS.epsilons is not None:
+        # Find target values of epsilon (among unique values).
+        results = []
+        for target in FLAGS.epsilons:
+            index = np.argmin(np.abs(target - np.array(eps)))
+            results.append((eps[index], acc[index][0], eff[index][0], cost[index][0]))
+
+        filename = os.path.join(res_dir, 'table.txt')
+        with open(filename, "w") as f:
+            latex_str = " 1 - $\eps$ & Succ. & $|\cset|$ & Amortized Cost"
+            f.write(latex_str + "\\\\" + "\n")
+            for result in results:
+                latex_str = "%2.2f " % (1 - result[0])
+                latex_str += "& %2.2f & %2.2f & %2.2f" % (result[1], result[2], result[3])
+                f.write(latex_str + "\\\\" + "\n")
+
+    # Reverse results.
     eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
     eps[eps == -1] = 0
     eps = 1 - eps
@@ -223,7 +256,7 @@ def plot_results(res_dir, n_bins=100):
     ax.set_xlim(-0.01, 1.01)
     ax.set_ylim(-0.01, 1.01)
     plot_smooth(ax, eff, acc, n_bins=n_bins, name="Conformal", lowauc=0.0, highauc=1.0, pre_zero=0., post_one=1.)
-    ax.set_ylabel("Success")
+    ax.set_ylabel("Accuracy")
     ax.set_xlabel("Predictive Efficiency")
 
     plt.legend()
@@ -261,7 +294,7 @@ def plot_results(res_dir, n_bins=100):
     plot_smooth(ax, eps, acc, n_bins=n_bins, name="Conformal", lowauc=0.0, highauc=1.0,
                 pre_zero=0., post_one=1.)
 
-    ax.set_ylabel("Success")
+    ax.set_ylabel("Accuracy")
     ax.set_xlabel("$1 - \epsilon$")
 
     plt.legend(loc="lower right")
@@ -277,7 +310,7 @@ def plot_results(res_dir, n_bins=100):
     ax.set_xlim(-0.01, 1.01)
     ax.set_ylim(-0.01, 1.01)
     plot_smooth(ax, eps, cost, n_bins=n_bins, name="Conformal", lowauc=0.0, highauc=1.0,
-                pre_zero=min(cost), post_one=max(cost))
+                pre_zero=min([x[0] for x in cost]), post_one=max([x[0] for x in cost]))
 
     ax.set_ylabel("Amortized Cost")
     ax.set_xlabel("$1 - \epsilon$")
@@ -290,7 +323,129 @@ def plot_results(res_dir, n_bins=100):
     plt.close()
 
 
-def plot_cascade_efficiency_breakdown(res_dirs, metrics, n_bins=100, baseline_dir=""):
+def plot_with_baselines(res_dirs, baseline_dir, n_bins=100, dest_dir=''):
+    '''res_dirs = [CP, Min CP]'''
+    task = get_task(res_dirs[-1])
+
+    baselines = get_baselines(baseline_dir)
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111)
+    ax.set_xlim(-0.01, 1.01)
+    ax.set_ylim(-0.01, 1.01)
+
+    def plot_eff(a):
+        linecycler = cycle(LINES)
+        colorcycler = cycle(COLORS)
+        for eps, eff, acc, metric in baselines:
+            if metric == 'end_logit':
+                metric = 'sum'
+            eps, eff, acc = np.array(eps), np.array(eff), np.array(acc)
+            eps[eps == -1] = 0
+            eps = 1 - eps
+            metric_str = ",".join([METRIC_ABBRV[task][m] if m in METRIC_ABBRV[task]
+                                   else m for m in metric.split(",")])
+            plot_smooth(a, eps, eff, n_bins=FLAGS.n_bins_eff_suc, name=metric_str, lowauc=0.0, highauc=1.0,
+                        pre_zero=0., post_one=1., line_style=next(linecycler), color=next(colorcycler))
+
+        # Plot only last layer of cascade + single best non-cascade.
+        res_dir = res_dirs[0]
+        res_file = get_res_file(res_dir)
+        data = json.load(open(res_file, "r"))
+        eps, eff, acc, cost = get_conformal(data)
+        eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
+        eps[eps == -1] = 0
+        eps = 1 - eps
+        plot_smooth(a, eps, eff, n_bins=n_bins, name="CP", lowauc=0.0, highauc=1.0,
+                    pre_zero=0., post_one=1., line_style=SINGLE_LINE, color=SINGLE_COLOR)
+
+        res_dir = res_dirs[1]
+        res_file = get_res_file(res_dir)
+        data = json.load(open(res_file, "r"))
+        eps, eff, acc, cost = get_conformal(data)
+        eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
+        eps[eps == -1] = 0
+        eps = 1 - eps
+        plot_smooth(a, eps, eff, n_bins=n_bins, name="Min CP", lowauc=0.0, highauc=1.0,
+                    pre_zero=0., post_one=1., line_style=OURS_LINE, color=OURS_COLOR)
+
+    plot_eff(ax)
+    ax.set_ylabel("Predictive Efficiency")
+    ax.set_xlabel("$1 - \epsilon$")
+    plt.xticks(np.arange(0, 1.1, 0.1))
+    plt.yticks(np.arange(0, 1.2, 0.2))
+    plt.legend(loc="upper left")
+
+    if FLAGS.x_lim_eff is not None and task == "qa":
+        axins = zoomed_inset_axes(ax, 0.8 * FLAGS.zoom_factor, loc='center', bbox_to_anchor=(0.5, 0.3), bbox_transform=ax.transAxes)
+        plot_eff(axins)
+        x1, x2, y1, y2 = FLAGS.x_lim_eff, 1, 0, FLAGS.y_lim_eff  # specify the limits
+        axins.set_xlim(x1, x2)
+        axins.set_ylim(y1, y2)
+        axins.set_xticks(np.around(np.arange(FLAGS.x_lim_eff, 1.001, 0.05), 2))
+        axins.set_xticklabels(np.around(np.arange(FLAGS.x_lim_eff, 1.001, 0.05), 2), fontsize=12)
+        axins.set_yticks(np.around(np.arange(0., FLAGS.y_lim_eff + 0.01, 0.1), 2))
+        axins.set_yticklabels(np.around(np.arange(0., FLAGS.y_lim_eff + 0.01, 0.1), 2), fontsize=12)
+        mark_inset(ax, axins, loc1=1, loc2=3, fc="none", ec="0.5")
+
+    name = "eps_eff_break_baseline.png"
+    out_path = os.path.join(dest_dir, name)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=FLAGS.dpi)
+    plt.close()
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111)
+    ax.set_xlim(-0.01, 1.01)
+    ax.set_ylim(-0.01, 1.01)
+
+    def plot_acc(a):
+        linecycler = cycle(LINES)
+        colorcycler = cycle(COLORS)
+        for eps, eff, acc, metric in baselines:
+            eps, eff, acc = np.array(eps), np.array(eff), np.array(acc)
+            eps[eps == -1] = 0
+            eps = 1 - eps
+            metric_str = ",".join([METRIC_ABBRV[task][m] if m in METRIC_ABBRV[task]
+                                   else m for m in metric.split(",")])
+            plot_smooth(a, eps, acc, n_bins=FLAGS.n_bins_eff_suc, name=metric_str, lowauc=0.0, highauc=1.0,
+                        pre_zero=0., post_one=1., line_style=next(linecycler), color=next(colorcycler))
+
+        # Plot only last layer of cascade + single best non-cascade.
+        res_dir = res_dirs[0]
+        res_file = get_res_file(res_dir)
+        data = json.load(open(res_file, "r"))
+        eps, eff, acc, cost = get_conformal(data)
+        eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
+        eps[eps == -1] = 0
+        eps = 1 - eps
+        plot_smooth(a, eps, acc, n_bins=n_bins, name="CP", lowauc=0.0, highauc=1.0,
+                    pre_zero=0., post_one=1., line_style=SINGLE_LINE, color=SINGLE_COLOR)
+
+        res_dir = res_dirs[1]
+        res_file = get_res_file(res_dir)
+        data = json.load(open(res_file, "r"))
+        eps, eff, acc, cost = get_conformal(data)
+        eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
+        eps[eps == -1] = 0
+        eps = 1 - eps
+        plot_smooth(a, eps, acc, n_bins=n_bins, name="Min CP", lowauc=0.0, highauc=1.0,
+                    pre_zero=0., post_one=1., line_style=OURS_LINE, color=OURS_COLOR)
+
+    plot_acc(ax)
+    ax.set_ylabel("Accuracy")
+    ax.set_xlabel("$1 - \epsilon$")
+    plt.xticks(np.arange(0, 1.1, 0.1))
+    plt.yticks(np.arange(0, 1.2, 0.2))
+    plt.legend(loc="lower right")
+
+    name = "eps_suc_break_baseline.png"
+    out_path = os.path.join(dest_dir, name)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=FLAGS.dpi)
+    plt.close()
+
+
+def plot_cascade_efficiency_breakdown(res_dirs, metrics, n_bins=100):
     """Plot breakdown by cascade configuration."""
     task = get_task(res_dirs[-1])
 
@@ -335,126 +490,7 @@ def plot_cascade_efficiency_breakdown(res_dirs, metrics, n_bins=100, baseline_di
     plt.tight_layout()
     plt.savefig(out_path, dpi=FLAGS.dpi)
     plt.close()
-
-    #####
-    # Baseline plots.
-    #####
-    if baseline_dir:
-        baselines = get_baselines(baseline_dir)
-        fig = plt.figure(figsize=(8, 6))
-        ax = fig.add_subplot(111)
-        ax.set_xlim(-0.01, 1.01)
-        ax.set_ylim(-0.01, 1.01)
-
-        def plot_eff(a):
-            linecycler = cycle(LINES)
-            colorcycler = cycle(COLORS)
-            for eps, eff, acc, metric in baselines:
-                eps, eff, acc = np.array(eps), np.array(eff), np.array(acc)
-                eps[eps == -1] = 0
-                eps = 1 - eps
-                metric_str = ",".join([METRIC_ABBRV[task][m] if m in METRIC_ABBRV[task]
-                                       else m for m in metric.split(",")])
-                plot_smooth(a, eps, eff, n_bins=FLAGS.n_bins_eff_suc, name=metric_str, lowauc=0.0, highauc=1.0,
-                            pre_zero=0., post_one=1., line_style=next(linecycler), color=next(colorcycler))
-
-            # Plot only last layer of cascade + single best non-cascade.
-            res_dir = res_dirs[-1]
-            res_file = get_res_file(res_dir)
-            data = json.load(open(res_file, "r"))
-            eps, eff, acc, cost = get_conformal(data)
-            eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
-            eps[eps == -1] = 0
-            eps = 1 - eps
-            plot_smooth(a, eps, eff, n_bins=n_bins, name="Min CP", lowauc=0.0, highauc=1.0,
-                        pre_zero=0., post_one=1., line_style=SINGLE_LINE, color=SINGLE_COLOR)
-
-            res_dir = res_dirs[-2]
-            res_file = get_res_file(res_dir)
-            data = json.load(open(res_file, "r"))
-            eps, eff, acc, cost = get_conformal(data)
-            eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
-            eps[eps == -1] = 0
-            eps = 1 - eps
-            plot_smooth(a, eps, eff, n_bins=n_bins, name="Cascaded Min CP", lowauc=0.0, highauc=1.0,
-                        pre_zero=0., post_one=1., line_style=OURS_LINE, color=OURS_COLOR)
-
-        plot_eff(ax)
-        ax.set_ylabel("Predictive Efficiency")
-        ax.set_xlabel("$1 - \epsilon$")
-        plt.xticks(np.arange(0, 1.1, 0.1))
-        plt.yticks(np.arange(0, 1.2, 0.2))
-        plt.legend(loc="upper left")
-
-        if FLAGS.x_lim_eff is not None and task == "qa":
-            axins = zoomed_inset_axes(ax, 0.8 * FLAGS.zoom_factor, loc='center', bbox_to_anchor=(0.5, 0.3), bbox_transform=ax.transAxes)
-            plot_eff(axins)
-            x1, x2, y1, y2 = FLAGS.x_lim_eff, 1, 0, FLAGS.y_lim_eff  # specify the limits
-            axins.set_xlim(x1, x2)
-            axins.set_ylim(y1, y2)
-            axins.set_xticks(np.around(np.arange(FLAGS.x_lim_eff, 1.001, 0.05), 2))
-            axins.set_xticklabels(np.around(np.arange(FLAGS.x_lim_eff, 1.001, 0.05), 2), fontsize=12)
-            axins.set_yticks(np.around(np.arange(0., FLAGS.y_lim_eff + 0.01, 0.1), 2))
-            axins.set_yticklabels(np.around(np.arange(0., FLAGS.y_lim_eff + 0.01, 0.1), 2), fontsize=12)
-            mark_inset(ax, axins, loc1=1, loc2=3, fc="none", ec="0.5")
-
-        name = "eps_eff_break_baseline.png"
-        out_path = os.path.join(res_dirs[-2], name)
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=FLAGS.dpi)
-        plt.close()
-
-        fig = plt.figure(figsize=(8, 6))
-        ax = fig.add_subplot(111)
-        ax.set_xlim(-0.01, 1.01)
-        ax.set_ylim(-0.01, 1.01)
-
-        def plot_acc(a):
-            linecycler = cycle(LINES)
-            colorcycler = cycle(COLORS)
-            for eps, eff, acc, metric in baselines:
-                eps, eff, acc = np.array(eps), np.array(eff), np.array(acc)
-                eps[eps == -1] = 0
-                eps = 1 - eps
-                metric_str = ",".join([METRIC_ABBRV[task][m] if m in METRIC_ABBRV[task]
-                                       else m for m in metric.split(",")])
-                plot_smooth(a, eps, acc, n_bins=FLAGS.n_bins_eff_suc, name=metric_str, lowauc=0.0, highauc=1.0,
-                            pre_zero=0., post_one=1., line_style=next(linecycler), color=next(colorcycler))
-
-            # Plot only last layer of cascade + single best non-cascade.
-            res_dir = res_dirs[-1]
-            res_file = get_res_file(res_dir)
-            data = json.load(open(res_file, "r"))
-            eps, eff, acc, cost = get_conformal(data)
-            eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
-            eps[eps == -1] = 0
-            eps = 1 - eps
-            plot_smooth(a, eps, acc, n_bins=n_bins, name="Min CP", lowauc=0.0, highauc=1.0,
-                        pre_zero=0., post_one=1., line_style=SINGLE_LINE, color=SINGLE_COLOR)
-
-            res_dir = res_dirs[-2]
-            res_file = get_res_file(res_dir)
-            data = json.load(open(res_file, "r"))
-            eps, eff, acc, cost = get_conformal(data)
-            eps, eff, acc, cost = np.array(list(reversed(eps))), list(reversed(eff)), list(reversed(acc)), list(reversed(cost))
-            eps[eps == -1] = 0
-            eps = 1 - eps
-            plot_smooth(a, eps, acc, n_bins=n_bins, name="Cascaded Min CP", lowauc=0.0, highauc=1.0,
-                        pre_zero=0., post_one=1., line_style=OURS_LINE, color=OURS_COLOR)
-
-        plot_acc(ax)
-        ax.set_ylabel("Success")
-        ax.set_xlabel("$1 - \epsilon$")
-        plt.xticks(np.arange(0, 1.1, 0.1))
-        plt.yticks(np.arange(0, 1.2, 0.2))
-        plt.legend(loc="lower right")
-
-        name = "eps_suc_break_baseline.png"
-        out_path = os.path.join(res_dirs[-2], name)
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=FLAGS.dpi)
-        plt.close()
-
+        
 
 def plot_equivalence_breakdown(res_dirs, names, n_bins=100):
     """Plot breakdown by equivalence configuration (true vs. false)."""
@@ -538,7 +574,7 @@ def plot_equivalence_breakdown(res_dirs, names, n_bins=100):
         plot_smooth(ax, eps, acc, n_bins=n_bins, name=name, lowauc=0.0, highauc=1.0, line_style=line_style,
                     color=color, pre_zero=0., post_one=1.)
 
-    ax.set_ylabel("Success")
+    ax.set_ylabel("Accuracy")
     ax.set_xlabel("$1 - \epsilon$")
 
     plt.legend(loc="lower right")
@@ -575,7 +611,7 @@ def plot_corrections(res_dirs, names, n_bins=100):
         plot_smooth(ax, eps, acc, n_bins=n_bins, name=name, lowauc=0.0, highauc=1.0,
                     line_style=line_style, color=color, pre_zero=0., post_one=1.)
 
-    ax.set_ylabel("Success")
+    ax.set_ylabel("Accuracy")
     ax.set_xlabel("$1 - \epsilon$")
     plt.legend(loc="lower right")
 
@@ -584,6 +620,65 @@ def plot_corrections(res_dirs, names, n_bins=100):
     plt.tight_layout()
     plt.savefig(out_path, dpi=FLAGS.dpi)
 
+def plot_casacde_cost_short(res_dirs, m, n_bins=100):
+    """
+    Plot minCP vs. CascadedMinCP amortized cost.
+    m = depth of cascade
+    res_dirs = minCP, CascadedMinCP
+    """
+
+    # Epsilon vs. amortized cost.
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111)
+    ax.set_xlim(-0.01, 1.01)
+    ax.set_ylim(-0.01, 1.01)
+
+    #MinCP
+    res_file = get_res_file(res_dirs[0])
+    data = json.load(open(res_file, "r"))
+    eps, _, _, cost = get_conformal(data)
+    eps, cost = np.array(list(reversed(eps))), np.array(list(reversed(cost)))
+    cost[:, :] = 1
+    eps[eps == -1] = 0
+    eps = 1 - eps
+    line_style = SINGLE_LINE
+    color = SINGLE_COLOR
+
+    name = "Min CP"
+    pre_zero = 1.0
+    post_one = 1.0
+    plot_smooth(ax, eps, cost, n_bins=n_bins, name=name, lowauc=0.0, highauc=1.0,
+                line_style=line_style, color=color, pre_zero=pre_zero, post_one=post_one)
+
+    #CascadedMinCP
+    res_file = get_res_file(res_dirs[1])
+    data = json.load(open(res_file, "r"))
+    eps, _, _, cost = get_conformal(data)
+    eps, cost = np.array(list(reversed(eps))), np.array(list(reversed(cost)))
+    eps[eps == -1] = 0
+    eps = 1 - eps
+    line_style = OURS_LINE
+    color = OURS_COLOR
+
+    name = "Cascaded Min CP"
+    pre_zero = 1.0 / m
+    post_one = 1.0
+    plot_smooth(ax, eps, cost, n_bins=n_bins, name=name, lowauc=0.0, highauc=1.0,
+                line_style=line_style, color=color, pre_zero=pre_zero, post_one=post_one)
+
+
+    ax.set_ylabel("Amortized Cost")
+    ax.set_xlabel("$1 - \epsilon$")
+    plt.legend(loc="lower right")
+
+    name = "eps_cost_break.png"
+    out_path = os.path.join(res_dirs[-1], name)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=FLAGS.dpi)
+    plt.close()
+
+
+    return
 
 def plot_cascade_cost_breakdown(res_dirs, metrics, n_bins=100):
     """Plot breakdown by cascade level w.r.t. amortized cost."""
@@ -614,11 +709,11 @@ def plot_cascade_cost_breakdown(res_dirs, metrics, n_bins=100):
         else:
             line_style = next(linecycler)
             color = next(colorcycler)
-        metric_str = ",".join([METRIC_ABBRV[task][m] if m in METRIC_ABBRV[task]
+        metric_str = ", ".join([METRIC_ABBRV[task][m] if m in METRIC_ABBRV[task]
                                else m for m in metric.split(",")])
         name = metric_str
-        pre_zero = min([c[0] for c in cost])
-        post_one = max([c[0] for c in cost])
+        pre_zero = 1.0 / len(metric.split(","))
+        post_one = 1.0
         plot_smooth(ax, eps, cost, n_bins=n_bins, name=name, lowauc=0.0, highauc=1.0,
                     line_style=line_style, color=color, pre_zero=pre_zero, post_one=post_one)
 
@@ -638,6 +733,8 @@ def main(_):
     if FLAGS.n_bins_eff_suc is None:
         FLAGS.n_bins_eff_suc = FLAGS.n_bins
 
+    FLAGS.epsilons = [float(f) for f in FLAGS.epsilons or []]
+
     # Collect all of the results files that match the filter string.
     dirs = glob.glob(os.path.join(FLAGS.exp_dir, "*{}*/results.json".format(FLAGS.filter)))
     exp_dirs = [os.path.dirname(os.path.abspath(d)) for d in dirs]
@@ -647,17 +744,18 @@ def main(_):
     all_dirs = [os.path.dirname(os.path.abspath(d)) for d in all_dirs]
 
     # Get the baseline dirs seperately.
-    if FLAGS.baseline_dir is None:
-        FLAGS.baseline_dir = os.path.join(
-            os.path.dirname(FLAGS.exp_dir.rstrip("/")),
-            "baselines",
-            os.path.basename(FLAGS.exp_dir.rstrip("/")))
-    baseline_dirs = glob.glob(os.path.join(FLAGS.baseline_dir, "**/results.json"))
-    baseline_dirs = [os.path.dirname(os.path.abspath(d)) for d in baseline_dirs]
-    if baseline_dirs:
-        baseline_dir = baseline_dirs[0]
-    else:
-        baseline_dir = ""
+    #if FLAGS.baseline_dir is None:
+    #    FLAGS.baseline_dir = os.path.join(
+    #        os.path.dirname(FLAGS.exp_dir.rstrip("/")),
+    #        "baselines",
+    #        os.path.basename(FLAGS.exp_dir.rstrip("/")))
+    #baseline_dirs = glob.glob(os.path.join(FLAGS.baseline_dir, "**/results.json"))
+    #baseline_dirs = [os.path.dirname(os.path.abspath(d)) for d in baseline_dirs]
+    #if baseline_dirs:
+    #    baseline_dir = baseline_dirs[0]
+    #else:
+    #    baseline_dir = ""
+    baseline_dir = FLAGS.baseline_dir
 
     for res_dir in exp_dirs:
         print("Processing {}".format(res_dir))
@@ -671,24 +769,33 @@ def main(_):
                 metrics = res_dir[start: end].split(",")
 
                 # 1) Tolerance vs. efficiency, comparison of main methods.
-                cp_dir = res_dir[:start] + metrics[-1] + res_dir[end:]
+                cp_metric = metrics[-1]
+                if cp_metric == "end_logit":
+                    cp_metric = "sum"
+                cp_dir = res_dir[:start] + cp_metric + res_dir[end:]
                 start = cp_dir.find("-equivalence=") + len("-equivalence=")
-                cp_dir = cp_dir[:start] + FLAGS.equivalence_baseline
-                cp_dir_min = cp_dir[:start] + "min"
+                cp_dir = cp_dir[:start] + "False"
+                cp_dir_min = cp_dir[:start] + "True"
                 start = res_dir.find("-equivalence=") + len("-equivalence=")
                 eq_val = res_dir[start:]
-                if eq_val == "min":
-                    break_dirs = [cp_dir, res_dir[:start] + FLAGS.equivalence_baseline, cp_dir_min, res_dir]
+                if eq_val == "True":
+                    break_dirs = [cp_dir, res_dir[:start] + "False", cp_dir_min, res_dir]
                     if all([d in all_dirs for d in break_dirs]):
                         plot_equivalence_breakdown(break_dirs,
                                                    ["CP", "Cascaded CP", "Min CP", "Cascaded Min CP"],
                                                    n_bins=FLAGS.n_bins)
 
-                # 2) Tolerance vs. efficiency AND accuracy vs. efficiency baselines.
-                if baseline_dir:
-                    print("Using baseline dir %s" % baseline_dir)
-                else:
-                    print("No baseline dir")
+                    cost_break_dirs = break_dirs[-2:]
+                    # 1.5) Tolerance vs. efficiency AND accuracy vs. efficiency baselines.
+                    break_dirs = [break_dirs[0]] + [break_dirs[2]]
+                    if baseline_dir:
+                        print("Using baseline dir %s" % baseline_dir)
+                        if all([d in all_dirs for d in break_dirs]):
+                            plot_with_baselines(break_dirs, baseline_dir, n_bins=FLAGS.n_bins, dest_dir=res_dir)
+                    else:
+                        print("No baseline dir")
+
+                # 2) Tolerance vs. efficiency AND accuracy, breakdown by cascade.
                 start = res_dir.find("-metrics=") + len("-metrics=")
                 end = res_dir.find("-equivalence=")
                 metrics_break = [",".join(metrics[:i]) for i in range(1, len(metrics) + 1)]
@@ -696,21 +803,23 @@ def main(_):
                 break_dirs = [res_dir[:start] + m + res_dir[end:] for m in metrics_break]
                 if len(break_dirs) > 0 and all([d in all_dirs for d in break_dirs]):
                     plot_cascade_efficiency_breakdown(break_dirs, metrics_break,
-                                                      n_bins=FLAGS.n_bins,
-                                                      baseline_dir=baseline_dir)
+                                                      n_bins=FLAGS.n_bins)
 
                 # 3) Tolerance vs. amortized cost, breakdown by cascade.
-                metrics_break = list(reversed([",".join(metrics[i:]) for i in range(len(metrics))]))
-                break_dirs = [res_dir[:start] + m + res_dir[end:] for m in metrics_break]
-                if len(break_dirs) > 0 and all([d in all_dirs for d in break_dirs[1:]]):
-                    plot_cascade_cost_breakdown(break_dirs, metrics_break, n_bins=FLAGS.n_bins)
+
+                #metrics_break = list(reversed([",".join(metrics[i:]) for i in range(len(metrics))]))
+                #break_dirs = [res_dir[:start] + m + res_dir[end:] for m in metrics_break]
+                #if len(break_dirs) > 0 and all([d in all_dirs for d in break_dirs[1:]]):
+                #    plot_cascade_cost_breakdown(break_dirs, metrics_break, n_bins=FLAGS.n_bins)
+                if all([d in all_dirs for d in cost_break_dirs]):
+                    plot_casacde_cost_short(cost_break_dirs, len(metrics), n_bins=FLAGS.n_bins)
 
             # 4) Finally, compare corrections in terms of tightness.
             if FLAGS.compare_corrections:
                 start = res_dir.find("-correction=") + len("-correction=")
                 end = res_dir.find("-metrics=")
                 corr = res_dir[start:end]
-                if not corr.startswith("ecdf"):
+                if not corr.startswith("simes"):
                     continue
                 if corr == "ecdf-biased":
                     all_corr = [c if c != "ecdf" else "ecdf-biased" for c in CORRECTIONS]

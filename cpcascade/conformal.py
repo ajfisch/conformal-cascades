@@ -2,10 +2,11 @@
 
 import collections
 import functools
-import multiprocessing
+import multiprocessing.pool
 import tqdm
 
 from absl import flags
+from absl import logging
 import numpy as np
 import scipy.interpolate
 import scipy.special
@@ -14,40 +15,42 @@ from cpcascade import utils
 
 EPS = 1e-18
 
+INF = 1e18
+
 FLAGS = flags.FLAGS
 
-MAX_THRESHOLDS = 20000
+MAX_THRESHOLDS = 5000
+
+ConformalLabel = collections.namedtuple(
+    "ConformalLabel",
+    ["idx", "pvalues"])
 
 ConformalResult = collections.namedtuple(
-    "Result",
-    ["qid", "efficiency", "accuracy", "scores", "pvalues", "iterations"])
+    "ConformalResult",
+    ["efficiency", "accuracy", "scores", "pvalues", "iterations"])
 
 
 def compute_pvalue(
     score,
     calibration_scores,
-    calibration_mask=None,
     smoothed=True,
-    laplace=True,
 ):
     """Estimate P(V >= v_i).
     Args:
       score: <float>[1] Nonconformity score of sample.
       calibration_scores: <float>[N] Nonconformity scores for calibration.
-      calibration_mask: <byte>[N] Points to include for calibration.
       smoothed: <bool> Apply randomized tie-breaking.
-      laplace: <bool> Apply laplace smoothing.
 
     Returns:
       pvalue: <float>
     """
-    if calibration_mask is None:
-        calibration_mask = np.ones_like(calibration_scores, dtype=np.bool)
-    greater = np.sum((calibration_scores > score) * calibration_mask)
-    equal = np.sum((calibration_scores == score) * calibration_mask)
+    greater = np.sum(calibration_scores > score)
+    equal = np.sum(calibration_scores == score)
     if smoothed:
         equal = np.random.random() * equal
-    pvalue = (greater + equal + laplace) / (calibration_scores.shape[0] + laplace)
+
+    # We add +1 to account for n + 1th example in conformalization process.
+    pvalue = (greater + equal + 1) / (calibration_scores.shape[0] + 1)
     return pvalue.item()
 
 
@@ -83,7 +86,7 @@ def predict_mht(
     """Return the conformal prediction set using multiple hypothesis testing.
 
     Args:
-      labels: <Label>[num_labels]
+      labels: <float>[max_labels, num_metrics]
         Candidate labels to consider.
       calibration_scores: <float>[num_calibration, num_metrics]
         Calibration points for m metrics.
@@ -103,7 +106,7 @@ def predict_mht(
     num_metrics = calibration_scores.shape[1]
 
     # Pair labels with conservative pvalues.
-    labels = [(y, [1.0] * num_metrics, []) for y in labels]
+    labels = [(idx, y, [1.0] * num_metrics, []) for idx, y in enumerate(labels)]
 
     # Evaluate conformal cascade.
     iterations = 0
@@ -111,10 +114,10 @@ def predict_mht(
         # C(x) for next round.
         kept_labels = []
 
-        for y, pvalues, corrected_pvalues in labels:
+        for idx, y, pvalues, corrected_pvalues in labels:
             # Update realized pvalue for cascade i.
             pvalues[i] = compute_pvalue(
-                score=y.metrics[i],
+                score=y[i],
                 calibration_scores=calibration_scores[:, i],
                 smoothed=smoothed)
 
@@ -122,7 +125,7 @@ def predict_mht(
             corrected_pvalue = compute_correction(pvalues, correction)
             if corrected_pvalue > epsilon:
                 corrected_pvalues.append(corrected_pvalue)
-                kept_labels.append((y, pvalues, corrected_pvalues))
+                kept_labels.append((idx, y, pvalues, corrected_pvalues))
 
             iterations += 1
 
@@ -130,42 +133,41 @@ def predict_mht(
         labels = kept_labels
 
     # Return remaining labels.
-    labels = [(y, corrected_pvalues) for y, _, corrected_pvalues in labels]
+    labels = [ConformalLabel(idx, corrected_pvalues) for idx, _, _, corrected_pvalues in labels]
     return labels, iterations
 
 
 def predict_ecdf(
     labels,
     calibration_scores,
-    calibration_ecdf,
+    ecdf_cache,
     epsilon,
     smoothed=True,
 ):
     """Return the conformal prediction set using the empirical CDF.
 
     Args:
-      labels: <Label>[num_labels]
+      labels: <float>[max_labels, num_metrics]
         Candidate labels to consider.
       calibration_scores: <float>[num_calibration, num_metrics]
         Calibration points for m metrics.
-      calibration_ecdf: <float>[num_calibration]
-        Empirical CDF for calibration points.
+      ecdf_cache: ECDF object.
+        Cached empirical CDF for calibration points.
       epsilon: <float>
         Tolerance level.
       smoothed: <bool>
         Whether to apply tie-breaking in pvalue computation.
 
     Returns:
-      labels: (<Label>, List<marginal ecdf>)[num_retained]
+      labels: List<ConformalLabels>[num_retained]
         Conformal label set with associated confidence values at each cascade level.
       iterations: <int>
         Number of iterations (pvalue) computations performed.
     """
     num_calibration, num_metrics = calibration_scores.shape
 
-    # Initialize a marginal pvalue and calibration mask placeholder
-    # for each label in the label set.
-    labels = [(y, np.ones(num_calibration, dtype=np.bool), []) for y in labels]
+    # Pair labels with conservative nonconformity scores.
+    labels = [(idx, y, np.array([-INF] * num_metrics), []) for idx, y in enumerate(labels)]
 
     # Evaluate conformal cascade.
     iterations = 0
@@ -173,35 +175,43 @@ def predict_ecdf(
         # C(x) for next round.
         kept_labels = []
 
-        for y, calibration_mask, marginal_pvalues in labels:
-            marginal_ecdf = compute_pvalue(
-                score=y.metrics[i],
-                calibration_scores=calibration_scores[:, i],
-                calibration_mask=calibration_mask,
+        for idx, y, scores, corrected_pvalues in labels:
+            # === Overview ===
+            # Given an m-dimensional metrics vector, [v^1, ..., v^m], we want to
+            # get a single scalar that represents its nonconformity. One such scalar
+            # is 1 - P(V^1 ≥ v^1, ..., V^m ≥ v^m) (i.e., derived from the ECDF).
+            #
+            # If we do this symmetrically to both the calibration and new test point,
+            # then the resulting scalar ECDF value will itself act as a nonconformity
+            # score. This is essentially the same as doing "full" conformal prediction,
+            # just with a very simple nonconformity measure. Higher ECDF values indicate
+            # a higher relative degree of nonconformity.
+            #
+            # Given the new joint ECDF values, we then compute standard p-values.
+            # To remain valid, we conservatively set unknown nonconformity measures to
+            # -INF (i.e., the most conforming possible). See paper for details.
+
+            # === Step One ===
+            # Update scores to use all realized values so far.
+            scores[i] = y[i]
+
+            # === Step Two ===
+            # Compute p' =  1 - P(V^1 ≥ v^1, ..., V^m ≥ v^m) for standard nonconformity scores.
+            # We get this for all n + 1 scores. The ECDF object caches this.
+            ecdf_calibration, ecdf_y = ecdf_cache.ecdf(scores, i)
+
+            # === Step Three ===
+            # Compute the new p-value for p', P(P ≥ p').
+            corrected_pvalue = compute_pvalue(
+                score=ecdf_y,
+                calibration_scores=ecdf_calibration,
                 smoothed=smoothed)
 
-            # Update ecdf to use this point.
-            calibration_ecdf_y = calibration_ecdf.ecdf(
-                value=y.metrics[i],
-                index=i,
-                mask=calibration_mask)
-
-            # Invert because now smaller is worse.
-            marginal_pvalue = compute_pvalue(
-                score=1 - marginal_ecdf,
-                calibration_scores=1 - calibration_ecdf_y,
-                smoothed=smoothed)
-
-            # Compare to epsilon.
-            if marginal_pvalue > epsilon:
-                # Update conditional mask.
-                greater = calibration_scores[:, i] > y.metrics[i]
-                equal = calibration_scores[:, i] == y.metrics[i]
-                if smoothed:
-                    equal *= np.random.randint(0, 2, equal.shape, np.bool)
-                calibration_mask *= (greater | equal)
-                marginal_pvalues.append(marginal_pvalue)
-                kept_labels.append((y, calibration_mask, marginal_pvalues))
+            # === Step Four ===
+            # Compare P(P ≥ p') to epsilon. We can safely reject if it is ≤ epsilon.
+            if corrected_pvalue > epsilon:
+                corrected_pvalues.append(corrected_pvalue)
+                kept_labels.append((idx, y, scores, corrected_pvalues))
 
             iterations += 1
 
@@ -209,14 +219,13 @@ def predict_ecdf(
         labels = kept_labels
 
     # Return remaining labels.
-    labels = [(y, marginal_pvalues) for y, _, marginal_pvalues in labels]
+    labels = [ConformalLabel(idx, marginal_pvalues) for idx, _, _, marginal_pvalues in labels]
     return labels, iterations
 
 
 def score_example(
     example,
     epsilon,
-    qid2answers,
     calibration_scores,
     calibration_ecdf=None,
     correction="simes",
@@ -225,8 +234,8 @@ def score_example(
     """Score an example for conformal prediction.
 
     Args:
-      example: <Example>
-        Input example to predict label set for.
+      example: [<float>[max_labels, num_metrics], <float>[max_labels]]
+        Input example to predict label set for, together with correct answer indices.
       epsilon: <float>
         Tolerance level.
       calibration_scores: <float>[num_calibration, num_metrics]
@@ -241,7 +250,8 @@ def score_example(
     Returns:
       result: <ConformalResult>
     """
-    qid, labels = example
+    labels, answers = example
+    answers = np.flatnonzero(answers)
     num_metrics = calibration_scores.shape[1]
 
     # Get conformal label set.
@@ -263,205 +273,153 @@ def score_example(
         prediction, iterations = predict_ecdf(
             labels=labels,
             calibration_scores=calibration_scores,
-            calibration_ecdf=calibration_ecdf,
+            ecdf_cache=calibration_ecdf,
             epsilon=epsilon,
             smoothed=smoothed)
     else:
         raise ValueError("Unknown CP method %s" % correction)
 
     # Compute metrics of the prediction.
-    answers = qid2answers[qid]
-    assert(answers), "Missing answers!"
-    pvalues = [pvalue for _, pvalue in prediction]
-    scores = [float(y.text in answers) for y, _ in prediction]
+    pvalues = [y.pvalues for y in prediction]
+    scores = [float(y.idx in answers) for y in prediction]
     efficiency = len(prediction) / len(labels)
     accuracy = float(sum(scores) >= 1)
-
-    result = ConformalResult(qid, efficiency, accuracy, scores, pvalues, iterations)
+    result = ConformalResult(efficiency, accuracy, scores, pvalues, iterations)
     return result
 
 
 class ECDF(object):
-    """Class to compute ECDF efficiently (for either full or biased)."""
+    """Class to compute cached ECDF efficiently."""
 
-    def __init__(self, values, smoothed=True, unbiased=True):
-        # Compute P(V_1 >= v_1, ..., V_n >= v_n)
-        self.smoothed = smoothed
-        self.unbiased = unbiased
-        num_points, num_metrics = values.shape
+    def __init__(self, calibration_values):
+        """Cache values for estimating the ECDF."""
+        num_points, num_metrics = calibration_values.shape
+
+        # [num_points, num_metrics]
+        self.calibration_values = calibration_values
+        self.num_points = num_points
 
         # [num_points, num_points, num_metrics]
-        diffs = np.expand_dims(values, 0) - np.expand_dims(values, 1)
-        greater = np.greater(diffs, 0).astype(np.float32)
-        equal = np.equal(diffs, 0).astype(np.float32)
-
-        # Apply random tie-breaking.
-        if smoothed:
-            equal *= np.random.randint(0, 2, equal.shape, np.bool)
-        greater_equal = greater + equal
+        less_equal = np.less_equal(np.expand_dims(calibration_values, 0),
+                                   np.expand_dims(calibration_values, 1))
 
         # [num_points, num_points]
-        greater_equal = np.all(greater_equal, axis=2)
+        less_equal = np.all(less_equal, axis=2)
 
         # [num_points]
-        greater_equal = greater_equal.sum(1)
+        self.less_equal = less_equal.sum(1)
 
-        # Only save what is necessary.
-        if unbiased:
-            self.greater_equal = greater_equal
-            self.values = values
-            self.num_points = num_points
-        else:
-            self.biased_ecdf = greater_equal / num_points
-
-    def ecdf(self, value, index, mask=None):
-        if not self.unbiased:
-            return self.biased_ecdf
+    def ecdf(self, values, i):
+        """Update ecdf using the new data point."""
+        # Compute for the old points.
+        # [num_points, num_metrics]
+        less_equal_cal = np.less_equal(
+            np.expand_dims(values, 0),
+            self.calibration_values)
 
         # [num_points]
-        greater = np.greater(value, self.values[:, index])
-        if mask is not None:
-            greater *= mask
-        greater = greater.astype(np.float32)
+        less_equal_cal = self.less_equal + np.all(less_equal_cal, axis=1)
+        ecdf_cal = less_equal_cal / (self.num_points + 1)
+
+        # Compute for the new point. We take a conservative estimate,
+        # P(V_1 ≤ v_1, ..., V_m ≤ v_m) ≥ 1 - P(not V_1 ≤ v_1, ..., V_i ≤ v_i).
+        # [num_points, num_metrics]
+        less_equal_val = np.less_equal(
+            self.calibration_values,
+            np.expand_dims(values, 0))
 
         # [num_points]
-        equal = np.equal(value, self.values[:, index])
-        if mask is not None:
-            equal *= mask
-        equal = equal.astype(np.float32)
+        less_equal_val = np.all(less_equal_val, axis=1)
+        ecdf_val = (less_equal_val.sum() + 1) / (self.num_points + 1)
 
-        # Apply random tie-breaking.
-        if self.smoothed:
-            equal *= np.random.randint(0, 2, equal.shape, np.bool)
-        greater_equal = greater + equal
-
-        # [num_points]
-        ecdf = (self.greater_equal + greater_equal) / (self.num_points + 1)
-
-        return ecdf
-
-
-def get_calibration_scores(examples, qid2answers, equivalence):
-    """Compute calibration set using correct values.
-
-    Args:
-      examples: <Example>[num_examples]
-        All examples to use for calibration (positives + negatives).
-      qid2answers: <dict>
-        Map of qid to answer set.
-      equivalence: <string>
-        How to sample from the equivalence set.
-
-    Return:
-      calibration_scores: <float>[num_examples, num_metrics]
-    """
-    # Collect full equivalence set.
-    calibration_labels = []
-    for qid, labels in examples:
-        answers = qid2answers[qid]
-        correct = []
-        for y in labels:
-            if y.text in answers:
-                correct.append(y)
-        if correct:
-            calibration_labels.append(correct)
-
-    # Note: when equivalence == "all", we expand all of the equivalence labels
-    # into individual (X, Y) pairs to calibrate on. This increases the effective
-    # sample size, which can be good in scenarios where the total number of
-    # calibration exampls is small (similar to, say, data augmentation).
-    # For comparison with min calibration, however, it can be a confounding factor
-    # in terms of where the improvements come from---so we leave an option to sample.
-    if equivalence == "all":
-        expanded = []
-        for labels in calibration_labels:
-            expanded.extend([[label] for label in labels])
-        calibration_labels = expanded
-
-    # Get metrics.
-    num_calibration = len(calibration_labels)
-    num_metrics = len(calibration_labels[0][0].metrics)
-    calibration_scores = np.empty((num_calibration, num_metrics))
-    for i, labels in enumerate(calibration_labels):
-        for j in range(num_metrics):
-            if equivalence == "min":
-                calibration_scores[i, j] = min([y.metrics[j] for y in labels])
-            elif equivalence == "sample":
-                calibration_scores[i, j] = np.random.choice([y.metrics[j] for y in labels])
-            else:
-                metrics = [y.metrics[j] for y in labels]
-                assert(len(metrics) == 1)
-                calibration_scores[i, j] = metrics[0]
-    return calibration_scores
-
-
-def _worker_init_fn(_qid2answers):
-    """Initialize workers with a copy of answers."""
-    global qid2answers
-    qid2answers = _qid2answers
+        return ecdf_cal, ecdf_val
 
 
 def _evaluate_conformal_trial(
     examples,
     correction,
-    equivalence,
     smoothed,
     target_epsilons,
+    equivalence=True,
+    threads=0,
+    cuda=False
 ):
     """Run inner evaluation loop."""
-    global qid2answers
-    calibration_examples, test_examples = examples
+    calibration_examples = examples[0]
+    calibration_answers = examples[1]
+    references = examples[2]
+    test_examples = examples[3]
+    test_answers = examples[4]
+    test_mask = examples[5]
 
-    # Retrieve just the correct labels for calibration.
-    calibration_scores = get_calibration_scores(
+    # Retrieve just the metrics for the calibration examples.
+    # [num_calibration, num_metrics]
+    calibration_scores = utils.get_calibration_scores(
         examples=calibration_examples,
-        qid2answers=qid2answers,
-        equivalence=equivalence)
+        answers=calibration_answers,
+        references=references if not equivalence else None)
+
+    # If using smoothing, apply random perturbation to break ties.
+    if smoothed:
+        test_examples += np.random.uniform(0.0, EPS, size=test_examples.shape)
+        calibration_examples += np.random.uniform(0.0, EPS, size=calibration_examples.shape)
 
     # Compute ECDF if necessary.
     if correction == "ecdf":
-        calibration_ecdf = ECDF(calibration_scores, smoothed)
-    elif correction == "ecdf-biased":
-        calibration_ecdf = ECDF(calibration_scores, smoothed, unbiased=False)
+        calibration_ecdf = ECDF(calibration_scores)
     else:
         calibration_ecdf = None
 
-    # Initialize output matrices.
-    num_examples = len(test_examples)
-    num_metrics = calibration_scores.shape[-1]
-    max_labels = max([len(ex.labels) for ex in test_examples])
-    label_mask = np.zeros((num_examples, max_labels))
-    pvalue_matrix = -np.ones((num_examples, max_labels, num_metrics))
-    scores_matrix = np.zeros((num_examples, max_labels))
-
-    # Set the epsilon level to be a no-op.
+    # Set the epsilon level to be a no-op, i.e., we never early exit.
     worker_fn = functools.partial(
         score_example,
         epsilon=-float("inf"),
-        qid2answers=qid2answers,
         calibration_scores=calibration_scores,
         calibration_ecdf=calibration_ecdf,
         correction=correction,
         smoothed=smoothed)
 
-    # Populate pvalue and accuracy matrices.
-    for i, result in enumerate(map(worker_fn, test_examples)):
+    # Only use multiprocessing with threads > 0.
+    if threads > 0:
+        workers = multiprocessing.pool.Pool(processes=threads)
+        map_fn = workers.imap
+    else:
+        map_fn = map
+
+    # Populate p-value matrix. We compute the p-value for each label.
+    logging.debug("Populating p-value matrix.")
+    pvalue_matrix = -np.ones_like(test_examples)
+    for i, result in enumerate(map_fn(worker_fn, zip(test_examples, test_answers))):
         for j in range(len(result.pvalues)):
-            label_mask[i, j] = 1
             pvalue_matrix[i, j] = result.pvalues[j]
-            scores_matrix[i, j] = result.scores[j]
+
+    # Close cleanly.
+    if threads > 0:
+        workers.close()
+        workers.join()
 
     # Evaluate all possible accuracies/efficiencies/cost per epsilon.
     viable_pvalues = np.unique(pvalue_matrix - EPS)
     np.random.shuffle(viable_pvalues)
     viable_pvalues = viable_pvalues[:MAX_THRESHOLDS]
-    epsilons = utils.evaluate_thresholds(
-        thresholds=sorted(viable_pvalues.tolist() + target_epsilons + [0, 1]),
-        threshold_matrix=pvalue_matrix,
-        scores_matrix=scores_matrix,
-        label_mask=label_mask)
+    thresholds = sorted(viable_pvalues.tolist() + target_epsilons + [0, 1])
+    logging.debug("Evaluating per epsilon over %s values.", len(thresholds))
+    if cuda:
+        epsilons = utils.evaluate_thresholds_cuda(
+            thresholds=thresholds,
+            threshold_matrix=pvalue_matrix,
+            scores_matrix=test_answers,
+            label_mask=test_mask)
+    else:
+        epsilons = utils.evaluate_thresholds(
+            thresholds=thresholds,
+            threshold_matrix=pvalue_matrix,
+            scores_matrix=test_answers,
+            label_mask=test_mask,
+            threads=threads)
 
     # Collect results.
+    logging.debug("Collecting results.")
     trial_results = {}
 
     # Find target values of epsilon (among unique values).
@@ -472,10 +430,11 @@ def _evaluate_conformal_trial(
     trial_results["epsilon"] = results
 
     # Then take advantage of the fact that it's a step function to fill in missing epsilon.
+    logging.debug("Fill missing epsilon.")
     points = np.arange(0, 1, 0.0001)
     values = [points]
     for i in range(1, 4):
-        f = scipy.interpolate.interp1d([e[0] for e in epsilons], [e[i] for e in epsilons], kind="previous")
+        f = scipy.interpolate.interp1d([e[0] for e in epsilons], [e[i] for e in epsilons], kind="next")
         values.append(f(points))
     epsilons = zip(*values)
     trial_results["values"] = []
@@ -487,43 +446,53 @@ def _evaluate_conformal_trial(
 
 def conformal_evaluation(
     examples,
-    qid2answers,
-    calibration_qids,
-    test_qids,
+    answers,
+    mask,
+    calibration_ids,
+    test_ids,
+    references=None,
     target_epsilons=None,
     correction=None,
     equivalence=None,
     smoothed=None,
-    threads=None,
+    inner_threads=None,
+    outer_threads=None,
 ):
     """Compute all conformal metrics.
 
     Args:
-      examples: <dict>
-        Dict of all qids to labels to evaluate.
-      qid2answers: <dict>
-        Map of qid to answer set.
-      calibration_qids: <list>
-        List of qids just for calibration.
-      test_qids: <list>
-        List of qids just for testing.
+      examples: <float> [num_examples, max_labels, num_metrics]
+        Array of label metrics.
+      mask: <float> [num_examples, max_labels]
+        Indicator for padding or not padding.
+      answers: <float> [num_examples, max_labels]
+        Indicator of acceptable/not acceptable labels.
+      calibration_ids: <list>
+        List of ids just for calibration.
+      test_ids: <list>
+        List of ids just for testing.
+      references: <int>[num_examples]
+        Indices to use as references.
       target_epsilons: <list>
         List of target epsilons.
       correction: <string>
         MHT correction method, one of {simes, bonferroni, ecdf}.
-      equivalence: <string>
-        How to sample from the equivalence set.
+      equivalence: <bool>
+        Use min nonconformity score from the acceptable lables.
       smoothed: <bool>
         Use tie-breaking during pvalue computation.
-      threads: <int>
-        Number of threads to use during multiprocessing.
+      inner_threads: <int>
+        Number of threads to use during multiprocessing inner loop.
+      outer_threads: <int>
+        Number of threads to use during multiprocessing outer loop.
 
     Returns:
       results: Dict of efficiency and accuracy results.
     """
     correction = correction if correction is not None else FLAGS.correction
     smoothed = smoothed if smoothed is not None else FLAGS.smoothed
-    threads = threads if threads is not None else FLAGS.threads
+    outer_threads = outer_threads if outer_threads is not None else FLAGS.outer_threads
+    inner_threads = inner_threads if inner_threads is not None else FLAGS.inner_threads
     equivalence = equivalence if equivalence is not None else FLAGS.equivalence
     target_epsilons = target_epsilons or []
 
@@ -534,14 +503,13 @@ def conformal_evaluation(
     all_epsilons = collections.defaultdict(list)
 
     # Only use multiprocessing with threads > 0.
-    if threads > 0:
-        workers = multiprocessing.Pool(
-            processes=threads,
-            initializer=_worker_init_fn,
-            initargs=(qid2answers,))
+    if outer_threads > 0:
+        if inner_threads > 0:
+            workers = multiprocessing.pool.ThreadPool(processes=outer_threads)
+        else:
+            workers = multiprocessing.pool.Pool(processes=outer_threads)
         map_fn = workers.imap_unordered
     else:
-        _worker_init_fn(qid2answers)
         map_fn = map
 
     worker_fn = functools.partial(
@@ -549,16 +517,29 @@ def conformal_evaluation(
         correction=correction,
         equivalence=equivalence,
         smoothed=smoothed,
-        target_epsilons=target_epsilons)
+        target_epsilons=target_epsilons,
+        threads=inner_threads,
+        cuda=FLAGS.cuda)
 
     # Gather and evaluate all trials.
     all_trials = []
-    for i in range(len(calibration_qids)):
-        calibration_examples = [utils.Example(qid, examples[qid]) for qid in calibration_qids[i]]
-        test_examples = [utils.Example(qid, examples[qid]) for qid in test_qids[i]]
-        all_trials.append((calibration_examples, test_examples))
+    logging.debug("Gather all trials.")
+    for i in range(len(calibration_ids)):
+        calibration_examples = examples[calibration_ids[i]]
+        calibration_answers = answers[calibration_ids[i]]
+        calibration_references = references[calibration_ids[i]]
+        test_examples = examples[test_ids[i]]
+        test_answers = answers[test_ids[i]]
+        test_mask = mask[test_ids[i]]
+        all_trials.append((calibration_examples,
+                           calibration_answers,
+                           calibration_references,
+                           test_examples,
+                           test_answers,
+                           test_mask))
 
     # Run.
+    logging.debug("Running trials.")
     with tqdm.tqdm(total=len(all_trials), desc="evaluating") as pbar:
         for result in map_fn(worker_fn, all_trials):
             trial_results["epsilon"].append(result["epsilon"])
@@ -566,7 +547,13 @@ def conformal_evaluation(
                 all_epsilons[epsilon].append((efficiency, accuracy, cost))
             pbar.update()
 
+    # Close cleanly.
+    if outer_threads > 0:
+        workers.close()
+        workers.join()
+
     # Average results over all trials.
+    logging.debug("Average results.")
     avg_all_epsilons = []
     for epsilon, trials in all_epsilons.items():
         efficiencies = utils.stats([trial[0] for trial in trials])
@@ -574,6 +561,7 @@ def conformal_evaluation(
         costs = utils.stats([trial[2] for trial in trials])
         avg_all_epsilons.append((epsilon, efficiencies, accuracies, costs))
 
+    logging.debug("Compute results for target epsilons.")
     avg_target_epsilons = []
     for i in range(len(target_epsilons)):
         epsilon = np.mean([trial[i][0] for trial in trial_results["epsilon"]])

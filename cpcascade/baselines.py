@@ -2,10 +2,11 @@
 
 import collections
 import functools
-import multiprocessing
+import multiprocessing.pool
 import tqdm
 
 from absl import flags
+from absl import logging
 import numpy as np
 import scipy.interpolate
 import scipy.special
@@ -16,49 +17,66 @@ EPS = 1e-18
 
 FLAGS = flags.FLAGS
 
-MAX_THRESHOLDS = 10000
+MAX_THRESHOLDS = 5000
 
 BaselineResult = collections.namedtuple(
     "BaselineResult",
-    ["qid", "scores", "thresholds"])
+    ["scores", "thresholds"])
 
 
-def _evaluate_baseline_trial(examples, baseline_class, target_epsilons):
+def _evaluate_baseline_trial(examples, baseline_class, target_epsilons, threads=0, cuda=False):
     """Run inner evaluation loop."""
-    global qid2answers
-    calibration_examples, test_examples = examples
+    calibration_examples = examples[0]
+    calibration_answers = examples[1]
+    calibration_mask = examples[2]
+    test_examples = examples[3]
+    test_answers = examples[4]
+    test_mask = examples[5]
 
     # Initialize baseline.
-    baseline = baseline_class(qid2answers=qid2answers)
+    baseline = baseline_class()
+
+    # Only use multiprocessing with threads > 0.
+    worker_fn = baseline.predict
+    if threads > 0:
+        workers = multiprocessing.pool.Pool(processes=threads)
+        map_fn = workers.imap
+    else:
+        map_fn = map
 
     # ***************************
     # CALIBRATION.
     # ***************************
 
     # Initialize output matrices (for calibration).
-    num_examples = len(calibration_examples)
-    max_labels = max([len(ex.labels) for ex in calibration_examples])
-    label_mask = np.zeros((num_examples, max_labels))
+    num_examples, max_labels = calibration_examples.shape[:2]
     threshold_matrix = -np.ones((num_examples, max_labels, 1)) * float("inf")
-    scores_matrix = np.zeros((num_examples, max_labels))
 
     # Populate threshold and accuracy matrices.
-    worker_fn = baseline.predict
-    for i, result in enumerate(map(worker_fn, calibration_examples)):
+    logging.debug("Populating threshold matrices")
+    for i, result in enumerate(map_fn(worker_fn, zip(calibration_examples, calibration_answers))):
         for j in range(len(result.thresholds)):
-            label_mask[i, j] = 1
-            threshold_matrix[i, j, 0] = result.thresholds[j]
-            scores_matrix[i, j] = result.scores[j]
+            threshold_matrix[i, j] = result.thresholds[j]
 
     # Evaluate all possible thresholds. Limit number.
     viable_thresholds = np.unique(threshold_matrix - EPS)
     np.random.shuffle(viable_thresholds)
     viable_thresholds = viable_thresholds[:MAX_THRESHOLDS]
-    thresholds = utils.evaluate_thresholds(
-        thresholds=sorted(viable_thresholds.tolist() + [np.max(threshold_matrix) + EPS]),
-        threshold_matrix=threshold_matrix,
-        scores_matrix=scores_matrix,
-        label_mask=label_mask)
+    thresholds = sorted(viable_thresholds.tolist() + [np.max(threshold_matrix) + EPS])
+    logging.debug("Evaluating threshold scores over %s values.", len(thresholds))
+    if cuda:
+        thresholds = utils.evaluate_thresholds_cuda(
+            thresholds=thresholds,
+            threshold_matrix=threshold_matrix,
+            scores_matrix=calibration_answers,
+            label_mask=calibration_mask)
+    else:
+        thresholds = utils.evaluate_thresholds(
+            thresholds=thresholds,
+            threshold_matrix=threshold_matrix,
+            scores_matrix=calibration_answers,
+            label_mask=calibration_mask,
+            threads=threads)
 
     # Find the thresholds for the desired accuracies. As accuracy is monotic in threshold value,
     # max{t: acc(t) > 1 - epsilon} = t of the next highest accuracy not equal to 1 - epsilon.
@@ -73,26 +91,28 @@ def _evaluate_baseline_trial(examples, baseline_class, target_epsilons):
     # ***************************
 
     # Initialize output matrices (for test).
-    num_examples = len(test_examples)
-    max_labels = max([len(ex.labels) for ex in test_examples])
-    label_mask = np.zeros((num_examples, max_labels))
+    num_examples, max_labels = test_examples.shape[:2]
     threshold_matrix = -np.ones((num_examples, max_labels, 1)) * float("inf")
-    scores_matrix = np.zeros((num_examples, max_labels))
 
-    # Populate threshold and accuracy matrices.
-    worker_fn = baseline.predict
-    for i, result in enumerate(map(worker_fn, test_examples)):
+    logging.debug("Populating threshold matrices for test answers.")
+    for i, result in enumerate(map_fn(worker_fn, zip(test_examples, test_answers))):
         for j in range(len(result.thresholds)):
-            label_mask[i, j] = 1
             threshold_matrix[i, j, 0] = result.thresholds[j]
-            scores_matrix[i, j] = result.scores[j]
 
     # Evaluate all possible thresholds.
-    thresholds = utils.evaluate_thresholds(
-        thresholds=calibration_thresholds_to_use,
-        threshold_matrix=threshold_matrix,
-        scores_matrix=scores_matrix,
-        label_mask=label_mask)
+    logging.debug("Evaluating threshold scores on test answers.")
+    if FLAGS.cuda:
+        thresholds = utils.evaluate_thresholds_cuda(
+            thresholds=calibration_thresholds_to_use,
+            threshold_matrix=threshold_matrix,
+            scores_matrix=test_answers,
+            label_mask=test_mask)
+    else:
+        thresholds = utils.evaluate_thresholds(
+            thresholds=calibration_thresholds_to_use,
+            threshold_matrix=threshold_matrix,
+            scores_matrix=test_answers,
+            label_mask=test_mask)
 
     epsilons = []
     for i, (_, efficiency, accuracy, _) in enumerate(thresholds):
@@ -112,43 +132,47 @@ def _evaluate_baseline_trial(examples, baseline_class, target_epsilons):
     return trial_results
 
 
-def _worker_init_fn(_qid2answers):
-    """Initialize workers with a copy of answers."""
-    global qid2answers
-    qid2answers = _qid2answers
-
-
 def baseline_evaluation(
-    target_epsilons,
     examples,
-    qid2answers,
+    answers,
+    mask,
+    calibration_ids,
+    test_ids,
+    target_epsilons,
     baseline_class,
-    calibration_qids=None,
-    test_qids=None,
-    threads=None,
+    references=None,
+    inner_threads=None,
+    outer_threads=None,
 ):
     """Compute all baseline metrics.
 
     Args:
+      examples: <float> [num_examples, max_labels, num_metrics]
+        Array of label metrics.
+      mask: <float> [num_examples, max_labels]
+        Indicator for padding or not padding.
+      answers: <float> [num_examples, max_labels]
+        Indicator of acceptable/not acceptable labels.
+      calibration_ids: <list>
+        List of ids just for calibration.
+      test_ids: <list>
+        List of ids just for testing.
       target_epsilons: <list>
         List of target epsilons.
-      examples: <dict>
-        Dict of all qids to labels to evaluate.
-      qid2answers: <dict>
-        Map of qid to answer set.
       baseline_class: <class>
         Return baseline predictor function.
-      calibration_qids: <list>
-        List of qids just for calibration.
-      test_qids: <list>
-        List of qids just for testing.
-      threads: <int>
-        Number of threads to use during multiprocessing.
+      references: <int>[num_examples]
+        Indices to use as references.
+      inner_threads: <int>
+        Number of threads to use during multiprocessing inner loop.
+      outer_threads: <int>
+        Number of threads to use during multiprocessing outer loop.
 
     Returns:
       results: Dict of efficiency and accuracy results.
     """
-    threads = threads if threads is not None else FLAGS.threads
+    outer_threads = outer_threads if outer_threads is not None else FLAGS.outer_threads
+    inner_threads = inner_threads if inner_threads is not None else FLAGS.inner_threads
 
     # Store results for all trials.
     trial_results = {"epsilon": []}
@@ -157,27 +181,41 @@ def baseline_evaluation(
     all_epsilons = collections.defaultdict(list)
 
     # Only use multiprocessing with threads > 0.
-    if threads > 0:
-        workers = multiprocessing.Pool(
-            processes=threads,
-            initializer=_worker_init_fn,
-            initargs=(qid2answers,))
-        map_fn = workers.imap_unordered
+    if outer_threads > 0:
+        if inner_threads > 0:
+            workers = multiprocessing.pool.ThreadPool(processes=outer_threads)
+        else:
+            workers = multiprocessing.pool.Pool(processes=outer_threads)
+        map_fn = workers.imap
     else:
-        _worker_init_fn(qid2answers)
         map_fn = map
 
     worker_fn = functools.partial(
         _evaluate_baseline_trial,
         baseline_class=baseline_class,
-        target_epsilons=target_epsilons)
+        target_epsilons=target_epsilons,
+        threads=inner_threads,
+        cuda=FLAGS.cuda)
 
     # Gather and evaluate all trials.
     all_trials = []
-    for i in range(len(calibration_qids)):
-        calibration_examples = [utils.Example(qid, examples[qid]) for qid in calibration_qids[i]]
-        test_examples = [utils.Example(qid, examples[qid]) for qid in test_qids[i]]
-        all_trials.append((calibration_examples, test_examples))
+    for i in range(len(calibration_ids)):
+        calibration_examples = examples[calibration_ids[i]]
+        calibration_mask = mask[calibration_ids[i]]
+        test_examples = examples[test_ids[i]]
+        test_answers = answers[test_ids[i]]
+        test_mask = mask[test_ids[i]]
+
+        calibration_references = references[calibration_ids[i]]
+        calibration_answers = np.zeros_like(calibration_examples)
+        calibration_answers[np.arange(len(calibration_references)), calibration_references] = 1
+
+        all_trials.append((calibration_examples,
+                           calibration_answers,
+                           calibration_mask,
+                           test_examples,
+                           test_answers,
+                           test_mask))
 
     # Run.
     with tqdm.tqdm(total=len(all_trials), desc="evaluating") as pbar:
@@ -214,46 +252,27 @@ class TopK(object):
     """Use the top-k ranked predictions."""
     name = "top_k"
 
-    def __init__(self, k=None, qid2answers=None):
-        self.k = k
-        self.qid2answers = qid2answers
-
     def predict(self, example):
-        global qid2answers
-        qid, labels = example
-        answers = self.qid2answers[qid]
-        assert(answers), "Answer does not exist!"
+        labels, answers = example
+        ranks = np.argsort(labels)
+        thresholds = -ranks
 
-        predictions = sorted(labels, key=lambda y: -y.metrics[0])
-        thresholds = [-i for i in range(len(predictions))]
-        if self.k:
-            predictions = predictions[:self.k]
-            thresholds = thresholds[:self.k]
-        scores = [float(label.text in answers) for label in predictions]
-        return BaselineResult(qid, scores, thresholds)
+        # Hypothetically would take top K here, but unncessary for any of our evaluations.
+
+        return BaselineResult(answers, thresholds)
 
 
 class Threshold(object):
     """Use a simple threshold for any metric."""
     name = "threshold"
 
-    def __init__(self, threshold=None, qid2answers=None):
-        self.threshold = threshold
-        self.qid2answers = qid2answers
-
     def predict(self, example):
-        qid, labels = example
-        answers = self.qid2answers[qid]
-        assert(answers), "Answer does not exist!"
+        labels, answers = example
 
-        label_scores = [y.metrics[0] for y in labels]
-        predictions = []
-        thresholds = []
-        for i, y in enumerate(labels):
-            score = label_scores[i]
-            if self.threshold and score < self.threshold:
-                continue
-            predictions.append(y)
-            thresholds.append(score)
-        scores = [float(label.text in answers) for label in predictions]
-        return BaselineResult(qid, scores, thresholds)
+        # Flip, because we assume higher is better.
+        labels = -labels
+
+        # Hypothetically would take any label with score > thresh here, but unnecessary for any
+        # of our evaluations.
+
+        return BaselineResult(answers, labels)
